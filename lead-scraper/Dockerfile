@@ -5,14 +5,12 @@ FROM node:20-alpine AS frontend-builder
 
 WORKDIR /app/frontend
 
-# Instalar dependências primeiro (melhor cache do Docker)
-COPY frontend/package*.json ./
+# COPY com prefixo lead-scraper/ pois o contexto é a raiz do repo
+COPY lead-scraper/frontend/package*.json ./
 RUN npm install
 
-# Copiar código e gerar o build de produção
-COPY frontend/ ./
+COPY lead-scraper/frontend/ ./
 RUN npm run build
-# Resultado: /app/frontend/dist/
 
 
 # -------------------------------------------------------
@@ -32,24 +30,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl ca-certificates fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Copiar e instalar dependências Python
-COPY backend/requirements.txt ./backend/
+# Instalar dependências Python
+COPY lead-scraper/backend/requirements.txt ./backend/
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# Instalar o Chromium do Playwright (com todas as dependências)
+# Instalar o Chromium do Playwright
 RUN playwright install chromium --with-deps
 
 # Copiar o código do backend
-COPY backend/ ./backend/
+COPY lead-scraper/backend/ ./backend/
 
 # Copiar o build do React gerado no Stage 1
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
-# Porta exposta para o EasyPanel/Traefik
 EXPOSE 8000
 
-# Diretório de trabalho do servidor
 WORKDIR /app/backend
 
-# Iniciar o servidor
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
