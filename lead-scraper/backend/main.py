@@ -1,9 +1,11 @@
 import asyncio
 import uuid
 import json
+import os
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from scraper import scrape_google_maps
@@ -116,7 +118,7 @@ async def get_status(session_id: str):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # Desativa buffering do Nginx para SSE
+            "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
     )
@@ -146,3 +148,24 @@ async def export(session_id: str):
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "sessoes_ativas": len(sessions)}
+
+
+# -------------------------------------------------------
+# Servir o frontend React (build estático)
+# IMPORTANTE: este bloco deve ficar DEPOIS de todos os
+# endpoints /api para que o catch-all não os intercepte.
+# -------------------------------------------------------
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+
+if os.path.exists(FRONTEND_DIR):
+    # Arquivos estáticos gerados pelo Vite (JS, CSS, imagens)
+    app.mount(
+        "/assets",
+        StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")),
+        name="assets",
+    )
+
+    # Catch-all: qualquer rota que não seja /api/* devolve o index.html (SPA)
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):
+        return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
