@@ -13,11 +13,6 @@ USER_AGENT = (
 async def scrape_google_maps(
     nicho: str, localizacao: str, max_resultados: int, session: dict
 ) -> list[dict]:
-    """
-    Função principal do scraper.
-    Abre o Google Maps, busca o nicho na localização e coleta dados de cada empresa.
-    Retorna lista de dicts com os dados extraídos.
-    """
     resultados = []
 
     async with async_playwright() as p:
@@ -28,6 +23,8 @@ async def scrape_google_maps(
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--lang=pt-BR",
             ],
         )
 
@@ -36,9 +33,9 @@ async def scrape_google_maps(
             locale="pt-BR",
             timezone_id="America/Sao_Paulo",
             viewport={"width": 1280, "height": 900},
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
         )
 
-        # Ocultar que é Playwright (evitar detecção como bot)
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
         )
@@ -46,40 +43,41 @@ async def scrape_google_maps(
         page = await context.new_page()
 
         try:
+            # Usar URL direta de busca do Google Maps
             query = f"{nicho} em {localizacao}"
-            url = f"https://www.google.com.br/maps/search/{query.replace(' ', '+')}"
+            encoded = query.replace(" ", "+")
+            url = f"https://www.google.com/maps/search/{encoded}/?hl=pt-BR"
 
             session["status"] = "Abrindo Google Maps..."
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await _delay(2.0, 3.5)
+            await _delay(2.0, 3.0)
 
-            # Verificar e tentar resolver CAPTCHA se presente
-            await _handle_captcha(page)
+            # --- Tratar tela de consentimento de cookies (muito comum em VPS/Docker) ---
+            session["status"] = "Verificando consentimento..."
+            await _aceitar_consentimento(page)
 
-            # Aceitar cookies se necessário
-            try:
-                accept_btn = await page.query_selector(
-                    'button[aria-label*="Aceitar"], button[aria-label*="Accept"], form[action*="consent"] button'
-                )
-                if accept_btn:
-                    await accept_btn.click()
-                    await _delay(1.0, 2.0)
-            except Exception:
-                pass
+            # --- Aguardar os resultados aparecerem ---
+            session["status"] = "Aguardando resultados do Google Maps..."
+            feed_encontrado = await _aguardar_feed(page)
 
-            # Aguardar o feed de resultados aparecer
-            session["status"] = f"Aguardando resultados do Google Maps..."
-            try:
-                await page.wait_for_selector('div[role="feed"]', timeout=20000)
-            except PlaywrightTimeout:
-                session["status"] = "Timeout aguardando resultados. Verifique o nicho/localização."
+            if not feed_encontrado:
+                # Tentar URL alternativa se o feed não aparecer
+                session["status"] = "Tentando URL alternativa..."
+                url2 = f"https://maps.google.com/maps?q={encoded}&hl=pt-BR"
+                await page.goto(url2, wait_until="domcontentloaded", timeout=30000)
+                await _delay(2.0, 3.0)
+                await _aceitar_consentimento(page)
+                feed_encontrado = await _aguardar_feed(page)
+
+            if not feed_encontrado:
+                session["status"] = "Feed de resultados não encontrado. O Google pode estar bloqueando ou não há resultados para essa busca."
                 return resultados
 
-            # Coletar resultados fazendo scroll no painel lateral
+            # --- Coletar resultados ---
             resultados = await _collect_results(page, max_resultados, session)
 
         except Exception as exc:
-            session["status"] = f"Erro no scraping: {str(exc)[:100]}"
+            session["status"] = f"Erro no scraping: {str(exc)[:120]}"
 
         finally:
             await browser.close()
@@ -87,23 +85,61 @@ async def scrape_google_maps(
     return resultados
 
 
+async def _aceitar_consentimento(page) -> bool:
+    """
+    Tenta aceitar/fechar telas de consentimento de cookies do Google.
+    Retorna True se encontrou e clicou em algo.
+    """
+    seletores_aceitar = [
+        # Botão "Aceitar tudo" em português
+        'button[aria-label*="Aceitar tudo"]',
+        'button[aria-label*="Accept all"]',
+        # Formulário de consentimento do Google
+        'form[action*="consent"] button',
+        # Botões com texto "Aceitar"
+        'button:has-text("Aceitar tudo")',
+        'button:has-text("Accept all")',
+        'button:has-text("Aceitar")',
+        'button:has-text("I agree")',
+        # ID específico do botão de consentimento
+        '#L2AGLb',
+        'button.tHlp8d',
+    ]
+
+    for sel in seletores_aceitar:
+        try:
+            btn = await page.query_selector(sel)
+            if btn and await btn.is_visible():
+                await btn.click()
+                await _delay(1.5, 2.5)
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+async def _aguardar_feed(page, timeout: int = 20000) -> bool:
+    """Aguarda o feed de resultados aparecer. Retorna True se encontrou."""
+    try:
+        await page.wait_for_selector('div[role="feed"]', timeout=timeout)
+        return True
+    except PlaywrightTimeout:
+        return False
+
+
 async def _collect_results(page, max_resultados: int, session: dict) -> list[dict]:
-    """
-    Itera sobre os cards do feed, clica em cada um para abrir o painel de detalhes
-    e extrai os dados. Continua fazendo scroll até atingir max_resultados.
-    """
     resultados = []
     ids_processados = set()
     tentativas_sem_novos = 0
-    scroll_count = 0
 
     while len(resultados) < max_resultados and tentativas_sem_novos < 8:
-        # Selecionar cards individuais no feed
+        # Tentar seletores de card em ordem de prioridade
         cards = await page.query_selector_all('div[role="feed"] > div[jsaction*="mouseover"]')
-
         if not cards:
-            # Tentar seletor alternativo
             cards = await page.query_selector_all('div[role="feed"] > div[tabindex]')
+        if not cards:
+            cards = await page.query_selector_all('div[role="feed"] > div')
 
         novos_nesta_rodada = 0
 
@@ -112,22 +148,23 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
                 break
 
             try:
-                # Usar o texto do card como ID único para evitar duplicatas
                 card_text = await card.inner_text()
-                card_id = hash(card_text[:80].strip())
+                card_text = card_text.strip()
 
-                if card_id in ids_processados or not card_text.strip():
+                # Ignorar cards vazios ou separadores
+                if len(card_text) < 3:
                     continue
 
-                # Rolar o card para a view antes de clicar
-                await card.scroll_into_view_if_needed()
-                await _delay(0.3, 0.7)
+                card_id = hash(card_text[:80])
+                if card_id in ids_processados:
+                    continue
 
-                # Clicar no card para abrir o painel de detalhes
+                await card.scroll_into_view_if_needed()
+                await _delay(0.3, 0.6)
+
                 await card.click()
                 await _delay(1.2, 2.0)
 
-                # Extrair dados do painel de detalhes lateral
                 dados = await _extract_detail_panel(page)
 
                 if dados and dados.get("nome"):
@@ -135,14 +172,12 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
                     ids_processados.add(card_id)
                     novos_nesta_rodada += 1
 
-                    # Atualizar sessão em tempo real
                     session["processados"] = len(resultados)
                     session["total"] = max(max_resultados, len(resultados))
                     session["status"] = f"Coletando resultados... ({len(resultados)}/{max_resultados})"
                     session["resultados"] = list(resultados)
 
             except Exception:
-                # Silenciosamente pular cards com problema
                 continue
 
         if novos_nesta_rodada == 0:
@@ -150,18 +185,12 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
         else:
             tentativas_sem_novos = 0
 
-        # Scroll no painel lateral para carregar mais resultados
+        # Scroll no feed para carregar mais
         try:
             feed = await page.query_selector('div[role="feed"]')
             if feed:
                 await feed.evaluate("el => { el.scrollTop += 800; }")
-                scroll_count += 1
                 await _delay(1.5, 2.5)
-
-                # Verificar se chegou ao fim do feed
-                end_marker = await page.query_selector('div[role="feed"] span[class*="HlvSq"]')
-                if end_marker:
-                    break
         except Exception:
             break
 
@@ -169,10 +198,6 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
 
 
 async def _extract_detail_panel(page) -> dict | None:
-    """
-    Extrai dados do painel lateral de detalhes de uma empresa no Google Maps.
-    Usa múltiplos seletores como fallback para resistir a mudanças no DOM do Google.
-    """
     dados = {
         "nome": None,
         "avaliacao": None,
@@ -184,7 +209,7 @@ async def _extract_detail_panel(page) -> dict | None:
         "whatsapp": None,
     }
 
-    # Aguardar o painel de detalhes carregar
+    # Aguardar painel de detalhes
     try:
         await page.wait_for_selector(
             '.DUwDvf, .lMbq3e h1, [class*="fontHeadlineLarge"]', timeout=6000
@@ -192,18 +217,18 @@ async def _extract_detail_panel(page) -> dict | None:
     except PlaywrightTimeout:
         return None
 
-    await _delay(0.3, 0.6)
+    await _delay(0.2, 0.5)
 
     try:
-        # Nome da empresa — vários seletores possíveis
-        for sel in ['.DUwDvf', '.lMbq3e h1', 'h1.fontHeadlineLarge', '[data-attrid="title"]']:
+        # Nome
+        for sel in ['.DUwDvf', '.lMbq3e h1', 'h1[class*="fontHeadline"]']:
             el = await page.query_selector(sel)
             if el:
                 dados["nome"] = (await el.inner_text()).strip()
                 break
 
-        # Categoria do negócio
-        for sel in ['.DkEaL', '.skqShb', '[jsaction*="category"]', 'button[jsaction*="category"]']:
+        # Categoria
+        for sel in ['.DkEaL', '.skqShb']:
             el = await page.query_selector(sel)
             if el:
                 text = (await el.inner_text()).strip()
@@ -211,12 +236,8 @@ async def _extract_detail_panel(page) -> dict | None:
                     dados["categoria"] = text
                     break
 
-        # Avaliação média (ex: "4.7")
-        for sel in [
-            '.F7nice > span > span[aria-hidden="true"]',
-            '.ceNzKf',
-            '[aria-label*="estrela"] span',
-        ]:
+        # Avaliação
+        for sel in ['.F7nice > span > span[aria-hidden="true"]', '.ceNzKf']:
             el = await page.query_selector(sel)
             if el:
                 text = (await el.inner_text()).strip()
@@ -225,27 +246,19 @@ async def _extract_detail_panel(page) -> dict | None:
                     break
 
         # Número de avaliações
-        for sel in [
-            'button[aria-label*="avalia"] span.F7nice',
-            '[jsaction*="reviews"]',
-            'span[aria-label*="avaliações"]',
-            'span[aria-label*="reviews"]',
-        ]:
-            el = await page.query_selector(sel)
-            if el:
-                label = await el.get_attribute("aria-label") or ""
-                text = await el.inner_text()
-                nums = re.findall(r"[\d\.]+", (label + text).replace(".", "").replace(",", ""))
-                if nums:
-                    dados["num_avaliacoes"] = nums[0]
-                    break
+        el = await page.query_selector('button[aria-label*="avalia"] span, [aria-label*="reviews"]')
+        if el:
+            label = await el.get_attribute("aria-label") or ""
+            text = await el.inner_text()
+            nums = re.findall(r"[\d]+", (label + text).replace(".", "").replace(",", ""))
+            if nums:
+                dados["num_avaliacoes"] = nums[0]
 
-        # Endereço — priorizar o data-item-id
+        # Endereço
         for sel in [
             'button[data-item-id*="address"] .Io6YTe',
             '[aria-label*="Endereço"] .Io6YTe',
-            'button[data-tooltip*="Copiar endereço"] .Io6YTe',
-            '[data-item-id*="address"]',
+            '[data-item-id*="address"] .Io6YTe',
         ]:
             el = await page.query_selector(sel)
             if el:
@@ -258,8 +271,7 @@ async def _extract_detail_panel(page) -> dict | None:
         for sel in [
             'button[data-item-id*="phone"] .Io6YTe',
             '[aria-label*="Telefone"] .Io6YTe',
-            'button[data-tooltip*="Copiar número"] .Io6YTe',
-            '[data-item-id*="phone"]',
+            '[aria-label*="phone"] .Io6YTe',
         ]:
             el = await page.query_selector(sel)
             if el:
@@ -273,18 +285,15 @@ async def _extract_detail_panel(page) -> dict | None:
             'a[data-item-id*="authority"]',
             '[aria-label*="Site"] a',
             'a[aria-label*="Site:"]',
-            'a[data-tooltip*="Abrir site"]',
         ]:
             el = await page.query_selector(sel)
             if el:
                 href = await el.get_attribute("href") or ""
                 text = (await el.inner_text()).strip()
-                # O Google às vezes usa redirect — pegar o domínio real
-                url_match = re.search(r"https?://(?:www\.)?([^/&\s]+)", href)
-                if url_match:
+                if href.startswith("http"):
                     dados["site"] = href
                 elif text and "." in text:
-                    dados["site"] = f"https://{text}" if not text.startswith("http") else text
+                    dados["site"] = f"https://{text}"
                 break
 
     except Exception:
@@ -293,19 +302,5 @@ async def _extract_detail_panel(page) -> dict | None:
     return dados if dados.get("nome") else None
 
 
-async def _handle_captcha(page, max_tentativas: int = 3):
-    """Detecta CAPTCHA e aguarda / recarrega até resolver (máx 3 tentativas)."""
-    for _ in range(max_tentativas):
-        captcha = await page.query_selector(
-            'form#captcha-form, iframe[src*="recaptcha"], #recaptcha'
-        )
-        if not captcha:
-            return
-        await asyncio.sleep(10)
-        await page.reload(wait_until="domcontentloaded")
-        await asyncio.sleep(3)
-
-
 async def _delay(min_s: float = 1.5, max_s: float = 3.5):
-    """Delay aleatório para simular comportamento humano."""
     await asyncio.sleep(random.uniform(min_s, max_s))
