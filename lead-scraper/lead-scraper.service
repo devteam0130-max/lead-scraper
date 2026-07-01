@@ -1,0 +1,47 @@
+[Unit]
+Description=Lead Scraper — Backend FastAPI
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+
+# Diretório de trabalho (onde ficam os arquivos Python)
+WorkingDirectory=/var/www/lead-scraper/backend
+
+# Usar o Python do virtualenv
+ExecStart=/var/www/lead-scraper/venv/bin/uvicorn main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1 \
+    --loop asyncio \
+    --log-level info
+
+# Reiniciar automaticamente em caso de falha
+Restart=on-failure
+RestartSec=5s
+
+# Variáveis de ambiente (ajuste conforme necessário)
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Playwright precisa de um display virtual em VPS sem GUI
+# Se tiver problemas, instale: apt install xvfb
+# E substitua ExecStart por: ExecStart=xvfb-run -a /var/www/lead-scraper/venv/bin/uvicorn ...
+Environment=DISPLAY=:99
+Environment=PLAYWRIGHT_BROWSERS_PATH=/var/www/lead-scraper/.playwright
+
+# Limitar uso de memória (ajuste se precisar de mais)
+# MemoryMax=2G
+
+# Timeout para parar o serviço
+TimeoutStopSec=30
+
+# Log de saída
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lead-scraper
+
+[Install]
+WantedBy=multi-user.target
