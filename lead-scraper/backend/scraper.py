@@ -128,9 +128,40 @@ async def _aguardar_feed(page, timeout: int = 20000) -> bool:
         return False
 
 
+def _chave_unica(dados: dict) -> str:
+    """
+    Gera uma chave de identidade única baseada nos dados extraídos.
+    Usa nome + telefone como chave primária.
+    Fallback: nome + endereço. Último recurso: só o nome.
+    Tudo normalizado (minúsculas, sem espaços extras, só alfanumérico).
+    """
+    def _norm(s: str) -> str:
+        if not s:
+            return ""
+        # Minúsculas, remove tudo que não é letra/número/espaço, colapsa espaços
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s]", "", s)
+        s = re.sub(r"\s+", " ", s)
+        return s
+
+    nome = _norm(dados.get("nome") or "")
+    telefone = re.sub(r"\D", "", dados.get("telefone") or "")  # só dígitos
+    endereco = _norm(dados.get("endereco") or "")
+
+    if nome and telefone:
+        return f"{nome}|tel:{telefone}"
+    if nome and endereco:
+        return f"{nome}|end:{endereco[:40]}"
+    return f"nome:{nome}"
+
+
 async def _collect_results(page, max_resultados: int, session: dict) -> list[dict]:
     resultados = []
-    ids_processados = set()
+    # Dois níveis de deduplicação:
+    # 1. cards_vistos → evita re-clicar no mesmo card durante o scroll
+    # 2. chaves_extraidas → evita adicionar o mesmo negócio mesmo que venha de cards diferentes
+    cards_vistos: set = set()
+    chaves_extraidas: set = set()
     tentativas_sem_novos = 0
 
     while len(resultados) < max_resultados and tentativas_sem_novos < 8:
@@ -155,9 +186,11 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
                 if len(card_text) < 3:
                     continue
 
-                card_id = hash(card_text[:80])
-                if card_id in ids_processados:
+                # Nível 1: evitar re-clicar no mesmo card
+                card_id = hash(card_text[:120])
+                if card_id in cards_vistos:
                     continue
+                cards_vistos.add(card_id)
 
                 await card.scroll_into_view_if_needed()
                 await _delay(0.3, 0.6)
@@ -167,15 +200,22 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
 
                 dados = await _extract_detail_panel(page)
 
-                if dados and dados.get("nome"):
-                    resultados.append(dados)
-                    ids_processados.add(card_id)
-                    novos_nesta_rodada += 1
+                if not dados or not dados.get("nome"):
+                    continue
 
-                    session["processados"] = len(resultados)
-                    session["total"] = max(max_resultados, len(resultados))
-                    session["status"] = f"Coletando resultados... ({len(resultados)}/{max_resultados})"
-                    session["resultados"] = list(resultados)
+                # Nível 2: evitar duplicata baseada nos dados reais extraídos
+                chave = _chave_unica(dados)
+                if chave in chaves_extraidas:
+                    continue  # mesmo negócio, pular silenciosamente
+                chaves_extraidas.add(chave)
+
+                resultados.append(dados)
+                novos_nesta_rodada += 1
+
+                session["processados"] = len(resultados)
+                session["total"] = max(max_resultados, len(resultados))
+                session["status"] = f"Coletando resultados... ({len(resultados)}/{max_resultados})"
+                session["resultados"] = list(resultados)
 
             except Exception:
                 continue
