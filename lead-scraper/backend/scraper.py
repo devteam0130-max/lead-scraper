@@ -24,16 +24,13 @@ async def scrape_google_maps(
                 "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-web-security",
-                "--lang=pt-BR",
             ],
         )
 
         context = await browser.new_context(
             user_agent=USER_AGENT,
-            locale="pt-BR",
-            timezone_id="America/Sao_Paulo",
+            # Sem locale fixo — deixa o Google Maps usar o idioma da região buscada
             viewport={"width": 1280, "height": 900},
-            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"},
         )
 
         await context.add_init_script(
@@ -43,37 +40,37 @@ async def scrape_google_maps(
         page = await context.new_page()
 
         try:
-            # Usar URL direta de busca do Google Maps
             query = f"{nicho} em {localizacao}"
             encoded = query.replace(" ", "+")
-            url = f"https://www.google.com/maps/search/{encoded}/?hl=pt-BR"
+
+            # Sem hl=pt-BR — deixa o Google servir no idioma local da busca
+            # Isso garante que aria-labels estejam no idioma correto da região
+            url = f"https://www.google.com/maps/search/{encoded}/"
 
             session["status"] = "Abrindo Google Maps..."
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _delay(2.0, 3.0)
 
-            # --- Tratar tela de consentimento de cookies (muito comum em VPS/Docker) ---
+            # Trata consentimento de cookies (múltiplos idiomas)
             session["status"] = "Verificando consentimento..."
             await _aceitar_consentimento(page)
 
-            # --- Aguardar os resultados aparecerem ---
+            # Aguarda o feed de resultados
             session["status"] = "Aguardando resultados do Google Maps..."
             feed_encontrado = await _aguardar_feed(page)
 
             if not feed_encontrado:
-                # Tentar URL alternativa se o feed não aparecer
                 session["status"] = "Tentando URL alternativa..."
-                url2 = f"https://maps.google.com/maps?q={encoded}&hl=pt-BR"
+                url2 = f"https://maps.google.com/maps?q={encoded}"
                 await page.goto(url2, wait_until="domcontentloaded", timeout=30000)
                 await _delay(2.0, 3.0)
                 await _aceitar_consentimento(page)
                 feed_encontrado = await _aguardar_feed(page)
 
             if not feed_encontrado:
-                session["status"] = "Feed de resultados não encontrado. O Google pode estar bloqueando ou não há resultados para essa busca."
+                session["status"] = "Feed de resultados não encontrado. Verifique o nicho/localização."
                 return resultados
 
-            # --- Coletar resultados ---
             resultados = await _collect_results(page, max_resultados, session)
 
         except Exception as exc:
@@ -87,26 +84,33 @@ async def scrape_google_maps(
 
 async def _aceitar_consentimento(page) -> bool:
     """
-    Tenta aceitar/fechar telas de consentimento de cookies do Google.
-    Retorna True se encontrou e clicou em algo.
+    Aceita telas de consentimento de cookies do Google em vários idiomas.
     """
-    seletores_aceitar = [
-        # Botão "Aceitar tudo" em português
-        'button[aria-label*="Aceitar tudo"]',
-        'button[aria-label*="Accept all"]',
-        # Formulário de consentimento do Google
-        'form[action*="consent"] button',
-        # Botões com texto "Aceitar"
-        'button:has-text("Aceitar tudo")',
-        'button:has-text("Accept all")',
-        'button:has-text("Aceitar")',
-        'button:has-text("I agree")',
-        # ID específico do botão de consentimento
-        '#L2AGLb',
+    seletores = [
+        '#L2AGLb',                               # ID fixo do botão do Google
         'button.tHlp8d',
+        'form[action*="consent"] button',
+        # Português
+        'button:has-text("Aceitar tudo")',
+        'button:has-text("Aceitar")',
+        'button[aria-label*="Aceitar tudo"]',
+        # Inglês
+        'button:has-text("Accept all")',
+        'button:has-text("I agree")',
+        'button[aria-label*="Accept all"]',
+        # Espanhol
+        'button:has-text("Aceptar todo")',
+        'button:has-text("Aceptar")',
+        # Francês
+        'button:has-text("Tout accepter")',
+        'button:has-text("Accepter")',
+        # Alemão
+        'button:has-text("Alle akzeptieren")',
+        # Italiano
+        'button:has-text("Accetta tutto")',
     ]
 
-    for sel in seletores_aceitar:
+    for sel in seletores:
         try:
             btn = await page.query_selector(sel)
             if btn and await btn.is_visible():
@@ -120,7 +124,6 @@ async def _aceitar_consentimento(page) -> bool:
 
 
 async def _aguardar_feed(page, timeout: int = 20000) -> bool:
-    """Aguarda o feed de resultados aparecer. Retorna True se encontrou."""
     try:
         await page.wait_for_selector('div[role="feed"]', timeout=timeout)
         return True
@@ -129,23 +132,17 @@ async def _aguardar_feed(page, timeout: int = 20000) -> bool:
 
 
 def _chave_unica(dados: dict) -> str:
-    """
-    Gera uma chave de identidade única baseada nos dados extraídos.
-    Usa nome + telefone como chave primária.
-    Fallback: nome + endereço. Último recurso: só o nome.
-    Tudo normalizado (minúsculas, sem espaços extras, só alfanumérico).
-    """
+    """Gera chave de identidade única para deduplicação baseada nos dados extraídos."""
     def _norm(s: str) -> str:
         if not s:
             return ""
-        # Minúsculas, remove tudo que não é letra/número/espaço, colapsa espaços
         s = s.lower().strip()
         s = re.sub(r"[^\w\s]", "", s)
         s = re.sub(r"\s+", " ", s)
         return s
 
     nome = _norm(dados.get("nome") or "")
-    telefone = re.sub(r"\D", "", dados.get("telefone") or "")  # só dígitos
+    telefone = re.sub(r"\D", "", dados.get("telefone") or "")
     endereco = _norm(dados.get("endereco") or "")
 
     if nome and telefone:
@@ -157,15 +154,11 @@ def _chave_unica(dados: dict) -> str:
 
 async def _collect_results(page, max_resultados: int, session: dict) -> list[dict]:
     resultados = []
-    # Dois níveis de deduplicação:
-    # 1. cards_vistos → evita re-clicar no mesmo card durante o scroll
-    # 2. chaves_extraidas → evita adicionar o mesmo negócio mesmo que venha de cards diferentes
     cards_vistos: set = set()
     chaves_extraidas: set = set()
     tentativas_sem_novos = 0
 
     while len(resultados) < max_resultados and tentativas_sem_novos < 8:
-        # Tentar seletores de card em ordem de prioridade
         cards = await page.query_selector_all('div[role="feed"] > div[jsaction*="mouseover"]')
         if not cards:
             cards = await page.query_selector_all('div[role="feed"] > div[tabindex]')
@@ -182,11 +175,9 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
                 card_text = await card.inner_text()
                 card_text = card_text.strip()
 
-                # Ignorar cards vazios ou separadores
                 if len(card_text) < 3:
                     continue
 
-                # Nível 1: evitar re-clicar no mesmo card
                 card_id = hash(card_text[:120])
                 if card_id in cards_vistos:
                     continue
@@ -203,10 +194,9 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
                 if not dados or not dados.get("nome"):
                     continue
 
-                # Nível 2: evitar duplicata baseada nos dados reais extraídos
                 chave = _chave_unica(dados)
                 if chave in chaves_extraidas:
-                    continue  # mesmo negócio, pular silenciosamente
+                    continue
                 chaves_extraidas.add(chave)
 
                 resultados.append(dados)
@@ -225,7 +215,6 @@ async def _collect_results(page, max_resultados: int, session: dict) -> list[dic
         else:
             tentativas_sem_novos = 0
 
-        # Scroll no feed para carregar mais
         try:
             feed = await page.query_selector('div[role="feed"]')
             if feed:
@@ -249,7 +238,6 @@ async def _extract_detail_panel(page) -> dict | None:
         "whatsapp": None,
     }
 
-    # Aguardar painel de detalhes
     try:
         await page.wait_for_selector(
             '.DUwDvf, .lMbq3e h1, [class*="fontHeadlineLarge"]', timeout=6000
@@ -286,19 +274,33 @@ async def _extract_detail_panel(page) -> dict | None:
                     break
 
         # Número de avaliações
-        el = await page.query_selector('button[aria-label*="avalia"] span, [aria-label*="reviews"]')
+        el = await page.query_selector(
+            'button[aria-label*="avalia"] span, button[aria-label*="review"] span, '
+            'button[aria-label*="Review"] span'
+        )
         if el:
             label = await el.get_attribute("aria-label") or ""
             text = await el.inner_text()
-            nums = re.findall(r"[\d]+", (label + text).replace(".", "").replace(",", ""))
+            nums = re.findall(r"\d+", (label + text).replace(".", "").replace(",", ""))
             if nums:
                 dados["num_avaliacoes"] = nums[0]
+
+        # -------------------------------------------------------
+        # Endereço, Telefone e Site usam data-item-id que é
+        # INDEPENDENTE DE IDIOMA — funciona em qualquer país.
+        # Aria-labels são mantidos como fallback multilíngue.
+        # -------------------------------------------------------
 
         # Endereço
         for sel in [
             'button[data-item-id*="address"] .Io6YTe',
-            '[aria-label*="Endereço"] .Io6YTe',
             '[data-item-id*="address"] .Io6YTe',
+            # Fallbacks multilíngues
+            '[aria-label*="Endereço"] .Io6YTe',   # PT
+            '[aria-label*="Address"] .Io6YTe',     # EN
+            '[aria-label*="Dirección"] .Io6YTe',   # ES
+            '[aria-label*="Adresse"] .Io6YTe',     # FR/DE
+            'button[data-item-id*="address"]',
         ]:
             el = await page.query_selector(sel)
             if el:
@@ -310,8 +312,14 @@ async def _extract_detail_panel(page) -> dict | None:
         # Telefone
         for sel in [
             'button[data-item-id*="phone"] .Io6YTe',
-            '[aria-label*="Telefone"] .Io6YTe',
-            '[aria-label*="phone"] .Io6YTe',
+            '[data-item-id*="phone"] .Io6YTe',
+            # Fallbacks multilíngues
+            '[aria-label*="Telefone"] .Io6YTe',    # PT
+            '[aria-label*="Phone"] .Io6YTe',        # EN
+            '[aria-label*="Teléfono"] .Io6YTe',    # ES
+            '[aria-label*="Téléphone"] .Io6YTe',   # FR
+            '[aria-label*="Telefon"] .Io6YTe',     # DE
+            'button[data-item-id*="phone"]',
         ]:
             el = await page.query_selector(sel)
             if el:
@@ -323,8 +331,14 @@ async def _extract_detail_panel(page) -> dict | None:
         # Site
         for sel in [
             'a[data-item-id*="authority"]',
-            '[aria-label*="Site"] a',
+            # Fallbacks multilíngues
+            '[aria-label*="Site"] a',               # PT
+            '[aria-label*="Website"] a',             # EN
+            '[aria-label*="Sitio web"] a',           # ES
+            '[aria-label*="Site web"] a',            # FR
+            '[aria-label*="Webseite"] a',            # DE
             'a[aria-label*="Site:"]',
+            'a[aria-label*="Website:"]',
         ]:
             el = await page.query_selector(sel)
             if el:
