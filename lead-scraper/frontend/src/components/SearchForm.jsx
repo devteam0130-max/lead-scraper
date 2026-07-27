@@ -4,6 +4,7 @@ export default function SearchForm({ onSearch, isSearching }) {
   const [nicho, setNicho] = useState("");
   const [localizacao, setLocalizacao] = useState("");
   const [maxResultados, setMaxResultados] = useState(100);
+  const [apenasSemssite, setApenasSemSite] = useState(false);
 
   function handleSubmit(e) {
     e.preventDefault();
@@ -12,6 +13,7 @@ export default function SearchForm({ onSearch, isSearching }) {
       nicho: nicho.trim(),
       localizacao: localizacao.trim(),
       max_resultados: maxResultados,
+      apenas_sem_site: apenasSemssite,
     });
   }
 
@@ -51,7 +53,7 @@ export default function SearchForm({ onSearch, isSearching }) {
                 id="localizacao"
                 type="text"
                 className="form-input"
-                placeholder="Ex: Salvador BA, São Paulo, Brasil"
+                placeholder="Ex: Salvador BA, São Paulo, New York USA"
                 value={localizacao}
                 onChange={(e) => setLocalizacao(e.target.value)}
                 disabled={isSearching}
@@ -78,6 +80,25 @@ export default function SearchForm({ onSearch, isSearching }) {
                 />
                 <span className="slider-value">{maxResultados}</span>
               </div>
+            </div>
+
+            {/* Campo 4: Filtro apenas sem site */}
+            <div className="form-group full-width">
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  className="checkbox-input"
+                  checked={apenasSemssite}
+                  onChange={(e) => setApenasSemSite(e.target.checked)}
+                  disabled={isSearching}
+                />
+                <span className="checkbox-text">
+                  🎯 Mostrar apenas contatos <strong>sem site</strong>
+                  <span className="checkbox-hint">
+                    Ideal para prospectar empresas que ainda não têm presença digital
+                  </span>
+                </span>
+              </label>
             </div>
 
             {/* Botão */}
