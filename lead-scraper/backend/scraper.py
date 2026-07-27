@@ -78,31 +78,163 @@ async def scrape_google_maps(
     return resultados
 
 
-def _endereco_na_localizacao(endereco: str, localizacao: str) -> bool:
+import unicodedata
+
+# DDI explícito (com +) → palavras-chave da região
+# Só usado quando o telefone tem "+" indicando DDI internacional explícito
+_DDI_PAISES = {
+    "55":  ["brasil", "brazil", "bahia", "sao paulo", "rio de janeiro",
+             "minas gerais", "parana", "pernambuco", "ceara"],
+    "1":   ["usa", "united states", "canada", "california", "new york", "texas",
+             "florida", "illinois", "georgia", "ohio", "michigan", "washington",
+             "ontario", "toronto", "vancouver", "british columbia"],
+    "44":  ["uk", "united kingdom", "england", "scotland", "wales",
+             "london", "britain", "manchester", "birmingham"],
+    "34":  ["spain", "espana", "espanha", "madrid", "barcelona", "valencia"],
+    "33":  ["france", "franca", "paris", "lyon", "marseille"],
+    "49":  ["germany", "deutschland", "alemanha", "berlin", "munich", "hamburg"],
+    "39":  ["italy", "italia", "italia", "rome", "roma", "milan", "milano"],
+    "351": ["portugal", "lisboa", "porto"],
+    "52":  ["mexico", "cidade do mexico", "guadalajara", "monterrey"],
+    "54":  ["argentina", "buenos aires", "cordoba"],
+    "56":  ["chile", "santiago"],
+    "57":  ["colombia", "bogota", "medellin"],
+    "51":  ["peru", "lima"],
+    "598": ["uruguay", "montevideo"],
+    "595": ["paraguay", "asuncion"],
+    "58":  ["venezuela", "caracas"],
+    "61":  ["australia", "sydney", "melbourne", "brisbane"],
+    "64":  ["new zealand", "auckland", "wellington"],
+    "81":  ["japan", "japao", "tokyo", "osaka"],
+    "86":  ["china", "beijing", "shanghai"],
+    "91":  ["india", "mumbai", "delhi", "bangalore"],
+}
+
+
+def _norm_geo(s: str) -> str:
+    """Normaliza string: remove acentos e converte para minúsculas."""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.lower().strip()
+
+
+def _extrair_ddi_explicito(telefone: str) -> str | None:
     """
-    Verifica se o endereço extraído corresponde à localização buscada.
-    Extrai palavras-chave da localização (cidade, estado, país) e verifica
-    se pelo menos uma aparece no endereço.
-    Retorna True se corresponder OU se não houver endereço (evita falsos negativos).
+    Extrai o DDI apenas quando o número tem "+" explícito.
+    Ex: "+5511999..." → "55", "+1 323..." → "1"
+    Números sem "+" (ex: "(11) 9xxxx") → retorna None (formato local, indeterminado)
     """
-    if not endereco:
-        # Sem endereço = não temos como saber, aceitar para não perder dados válidos
+    if not telefone or "+" not in telefone:
+        return None  # sem "+" = formato local = não podemos saber o país
+
+    digitos = re.sub(r"\D", "", telefone.split("+")[-1])
+    for ddi in sorted(_DDI_PAISES.keys(), key=len, reverse=True):
+        if digitos.startswith(ddi) and len(digitos) > len(ddi) + 4:
+            return ddi
+    return None
+
+
+def _ddi_compativel_com_localizacao(telefone: str, localizacao: str) -> bool:
+    """
+    Verifica se o DDI explícito do telefone é compatível com a localização.
+    Só age quando o telefone tem "+" — caso contrário retorna True (indeterminado).
+    """
+    ddi = _extrair_ddi_explicito(telefone)
+    if not ddi:
+        return True  # formato local, não podemos determinar o país
+
+    loc_norm = _norm_geo(localizacao)
+
+    # Verificar se a localização pertence a OUTRO DDI (conflito claro)
+    for outro_ddi, palavras in _DDI_PAISES.items():
+        if outro_ddi == ddi:
+            continue
+        if any(_norm_geo(p) in loc_norm for p in palavras):
+            return False  # localização é de outro país
+
+    return True  # compatível ou indeterminado
+
+
+# Mapeamento de nomes completos → siglas (e vice-versa)
+# Permite que "California" bata com endereços que têm "CA"
+_NOME_PARA_SIGLA = {
+    # Estados USA
+    "california": "ca", "texas": "tx", "new york": "ny", "florida": "fl",
+    "illinois": "il", "georgia": "ga", "ohio": "oh", "michigan": "mi",
+    "washington": "wa", "arizona": "az", "nevada": "nv", "oregon": "or",
+    "colorado": "co", "massachusetts": "ma", "virginia": "va",
+    "north carolina": "nc", "south carolina": "sc", "tennessee": "tn",
+    "pennsylvania": "pa", "new jersey": "nj", "maryland": "md",
+    "minnesota": "mn", "wisconsin": "wi", "missouri": "mo",
+    # Estados Brasil
+    "bahia": "ba", "sao paulo": "sp", "rio de janeiro": "rj",
+    "minas gerais": "mg", "parana": "pr", "rio grande do sul": "rs",
+    "santa catarina": "sc", "pernambuco": "pe", "ceara": "ce",
+    "goias": "go", "para": "pa", "amazonas": "am", "maranhao": "ma",
+    "espirito santo": "es", "mato grosso": "mt", "mato grosso do sul": "ms",
+    "rio grande do norte": "rn", "alagoas": "al", "sergipe": "se",
+    "paraiba": "pb", "piaui": "pi", "tocantins": "to", "rondonia": "ro",
+    "amapa": "ap", "roraima": "rr", "acre": "ac", "distrito federal": "df",
+    # Países comuns
+    "brasil": "br", "brazil": "br", "united states": "us",
+    "united kingdom": "uk", "great britain": "gb",
+}
+
+
+def _termos_localizacao(localizacao: str) -> list[str]:
+    """
+    Extrai termos relevantes da localização, incluindo siglas equivalentes.
+    Ex: "California" → ["california", "ca"]
+    Ex: "São Paulo, SP" → ["sao", "paulo", "sp"]
+    """
+    IGNORAR = {"de", "do", "da", "dos", "das", "em", "no", "na", "e", "o", "a",
+               "in", "at", "the", "of", "and", "los", "las", "el", "la"}
+    termos = set()
+
+    loc_norm = _norm_geo(localizacao)
+
+    # Adicionar tokens individuais
+    for t in localizacao.replace(",", " ").split():
+        t_norm = _norm_geo(t.strip().rstrip(".,"))
+        if len(t_norm) >= 2 and t_norm not in IGNORAR:
+            termos.add(t_norm)
+
+    # Adicionar siglas correspondentes a nomes completos
+    for nome, sigla in _NOME_PARA_SIGLA.items():
+        if nome in loc_norm:
+            termos.add(sigla)
+        if sigla in loc_norm.split():
+            termos.add(nome)
+
+    return list(termos)
+
+
+def _endereco_na_localizacao(endereco: str, localizacao: str,
+                              telefone: str = "") -> bool:
+    """
+    Verifica se o resultado corresponde à localização buscada.
+    Cascata de validação:
+    1. Endereço disponível → verificar termos da localização no endereço
+    2. Sem endereço + telefone com "+" explícito → verificar DDI
+    3. Demais casos → aceitar (dados insuficientes para rejeitar com segurança)
+    """
+    if not localizacao:
         return True
 
-    def _norm(s: str) -> str:
-        return s.lower().strip()
+    # --- Caso 1: endereço disponível ---
+    if endereco and endereco.strip():
+        endereco_norm = _norm_geo(endereco)
+        termos = _termos_localizacao(localizacao)
+        if not termos:
+            return True
+        return any(termo in endereco_norm for termo in termos)
 
-    endereco_norm = _norm(endereco)
+    # --- Caso 2: sem endereço, telefone com DDI explícito ---
+    if telefone and "+" in telefone:
+        return _ddi_compativel_com_localizacao(telefone, localizacao)
 
-    # Extrair termos relevantes da localização (ignorar palavras muito curtas)
-    termos = [
-        _norm(t.strip().rstrip(",").rstrip(".")
-        ) for t in localizacao.replace(",", " ").split()
-        if len(t.strip()) > 2
-    ]
-
-    # Se pelo menos um termo da localização aparecer no endereço, aceitar
-    return any(termo in endereco_norm for termo in termos)
+    # --- Caso 3: dados insuficientes → aceitar ---
+    return True
 
 
 async def _aceitar_consentimento(page) -> bool:
@@ -218,7 +350,12 @@ async def _collect_results(
                 chaves_extraidas.add(chave)
 
                 # Filtro geográfico: rejeitar resultados de outras localidades
-                if not _endereco_na_localizacao(dados.get("endereco") or "", localizacao):
+                # Usa endereço como fonte primária e telefone como fallback
+                if not _endereco_na_localizacao(
+                    dados.get("endereco") or "",
+                    localizacao,
+                    dados.get("telefone") or "",
+                ):
                     filtrados_por_local += 1
                     session["status"] = (
                         f"Coletando resultados... ({len(resultados)}/{max_resultados}) "
