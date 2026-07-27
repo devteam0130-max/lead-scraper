@@ -1,215 +1,134 @@
-export default function ResultsTable({ resultados, sessionId, concluido, apenasSemSite }) {
-  // Aplicar filtro se checkbox estiver marcado
-  const resultadosFiltrados = apenasSemSite
-    ? resultados.filter((r) => !r.site)
-    : resultados;
+import { useState, useEffect, useRef } from "react";
+import SearchForm from "./components/SearchForm.jsx";
+import StatusBar from "./components/StatusBar.jsx";
+import ResultsTable from "./components/ResultsTable.jsx";
 
-  // Contadores baseados nos dados filtrados
-  const qtdWpp = resultadosFiltrados.filter((r) => r.whatsapp).length;
-  const qtdSemSite = resultados.filter((r) => !r.site).length;
+export default function App() {
+  const [sessionId, setSessionId] = useState(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const [status, setStatus] = useState("");
+  const [processados, setProcessados] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [resultados, setResultados] = useState([]);
+  const [concluido, setConcluido] = useState(false);
+  const [erro, setErro] = useState(null);
+  const [apenasSemSite, setApenasSemSite] = useState(false);
 
-  // Formatar domínio curto para exibição
-  function displayUrl(url) {
-    if (!url) return "";
+  const esRef = useRef(null);
+
+  async function handleSearch(params) {
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+
+    setResultados([]);
+    setProcessados(0);
+    setTotal(params.max_resultados);
+    setConcluido(false);
+    setErro(null);
+    setStatus("Iniciando...");
+    setIsSearching(true);
+    setApenasSemSite(params.apenas_sem_site || false);
+
     try {
-      const u = new URL(url.startsWith("http") ? url : `https://${url}`);
-      return u.hostname.replace(/^www\./, "");
-    } catch {
-      return url.slice(0, 30);
+      const resp = await fetch("/api/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params),
+      });
+
+      if (!resp.ok) throw new Error(`Erro ao iniciar busca: ${resp.status}`);
+
+      const { session_id } = await resp.json();
+      setSessionId(session_id);
+
+      const es = new EventSource(`/api/status/${session_id}`);
+      esRef.current = es;
+
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          setStatus(data.status || "");
+          setProcessados(data.processados ?? 0);
+          setTotal(data.total ?? 0);
+          setResultados(data.resultados ?? []);
+          if (data.erro) setErro(data.erro);
+          if (data.concluido) {
+            setConcluido(true);
+            setIsSearching(false);
+            es.close();
+            esRef.current = null;
+          }
+        } catch {
+          // ignorar mensagens malformadas
+        }
+      };
+
+      es.onerror = () => {
+        setConcluido(true);
+        setIsSearching(false);
+        es.close();
+        esRef.current = null;
+      };
+
+    } catch (err) {
+      setErro(err.message);
+      setIsSearching(false);
     }
   }
 
-  // Exportar apenas os resultados filtrados
-  function handleExport() {
-    // Passar o filtro como query param para o backend saber quais exportar
-    // Como o filtro é no frontend, enviamos os IDs via workaround:
-    // O mais simples é exportar tudo e filtrar no download via blob
-    if (apenasSemSite) {
-      exportarFiltrado(resultadosFiltrados);
-    } else {
-      const link = document.createElement("a");
-      link.href = `/api/export/${sessionId}`;
-      link.download = `leads_${sessionId.slice(0, 8)}.xlsx`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    }
-  }
+  useEffect(() => {
+    return () => { if (esRef.current) esRef.current.close(); };
+  }, []);
 
-  // Para o filtro sem site, chamar o endpoint com query param
-  function exportarFiltrado(dados) {
-    // Usamos o endpoint padrão mas passando flag de filtro
-    const url = `/api/export/${sessionId}?sem_site=true`;
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `leads_sem_site_${sessionId.slice(0, 8)}.xlsx`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  }
+  const qtdWpp = resultados.filter((r) => r.whatsapp).length;
 
   return (
-    <div className="card">
-      <div className="card-header">
-        <span>📊</span>
-        <span className="card-header-title">Resultados</span>
-      </div>
+    <div className="app-wrapper">
+      <header className="app-header">
+        <h1 className="app-title">🔍 Buscador de Leads</h1>
+        <p className="app-subtitle">
+          Encontre empresas e extraia contatos do Google Maps
+        </p>
+      </header>
 
-      <div className="card-body">
-        {/* Cabeçalho com contadores */}
-        <div className="results-header">
-          <div className="results-counter">
-            <span className="counter-badge">
-              <strong>{resultados.length}</strong> coletados
-            </span>
-            {qtdSemSite > 0 && (
-              <span className="counter-badge" style={{ background: "#fef3c7", color: "#92400e" }}>
-                🌐 <strong>{qtdSemSite}</strong> sem site
-              </span>
-            )}
-            {qtdWpp > 0 && (
-              <span className="counter-badge green">
-                💬 <strong>{qtdWpp}</strong> com WhatsApp
-              </span>
-            )}
-            {apenasSemSite && (
-              <span className="counter-badge" style={{ background: "#ede9fe", color: "#5b21b6" }}>
-                🎯 Filtro ativo: <strong>{resultadosFiltrados.length}</strong> sem site
-              </span>
-            )}
-          </div>
+      <main className="app-main">
+        <SearchForm onSearch={handleSearch} isSearching={isSearching} />
 
-          {resultadosFiltrados.length > 0 && (
-            <button className="btn-export" onClick={handleExport}>
-              ⬇️ Exportar {apenasSemSite ? "sem site " : ""}(.xlsx)
-            </button>
-          )}
-        </div>
+        {sessionId && (
+          <StatusBar
+            status={status}
+            processados={processados}
+            total={total}
+            concluido={concluido}
+            qtdWpp={qtdWpp}
+          />
+        )}
 
-        {/* Aviso quando filtro está ativo */}
-        {apenasSemSite && resultados.length > 0 && (
+        {erro && (
           <div style={{
-            marginTop: "12px",
-            padding: "10px 14px",
-            background: "#ede9fe",
-            border: "1px solid #c4b5fd",
-            borderRadius: "6px",
-            fontSize: "0.8rem",
-            color: "#5b21b6",
+            background: "#fef2f2",
+            border: "1px solid #fecaca",
+            borderRadius: "8px",
+            padding: "14px 18px",
+            color: "#b91c1c",
+            fontSize: "0.875rem",
+            fontWeight: 500,
           }}>
-            🎯 Filtro ativo — mostrando <strong>{resultadosFiltrados.length}</strong> de{" "}
-            <strong>{resultados.length}</strong> contatos (sem site). Desmarque o filtro no
-            formulário para ver todos.
+            ⚠️ {erro}
           </div>
         )}
 
-        {/* Tabela ou empty state */}
-        {resultadosFiltrados.length === 0 ? (
-          <div className="empty-state">
-            <span className="empty-icon">
-              {apenasSemSite && resultados.length > 0 ? "🌐" : "🔍"}
-            </span>
-            <span>
-              {apenasSemSite && resultados.length > 0
-                ? "Nenhum contato sem site encontrado. Todos os resultados têm site."
-                : "Os resultados aparecerão aqui conforme forem coletados..."}
-            </span>
-          </div>
-        ) : (
-          <div className="table-scroll">
-            <table className="results-table">
-              <thead>
-                <tr>
-                  <th>#</th>
-                  <th>Nome</th>
-                  <th>Telefone</th>
-                  <th>WhatsApp</th>
-                  <th>Endereço</th>
-                  <th>Site</th>
-                  <th>⭐</th>
-                </tr>
-              </thead>
-              <tbody>
-                {resultadosFiltrados.map((r, idx) => (
-                  <tr key={idx}>
-                    <td>{idx + 1}</td>
-
-                    <td className="td-nome" title={r.nome}>
-                      {r.nome || "—"}
-                    </td>
-
-                    <td className="td-phone">
-                      {r.telefone || <span style={{ color: "#cbd5e1" }}>—</span>}
-                    </td>
-
-                    <td>
-                      {r.whatsapp ? (
-                        <a
-                          href={
-                            r.whatsapp.startsWith("http")
-                              ? r.whatsapp
-                              : `https://wa.me/${r.whatsapp}`
-                          }
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          style={{ textDecoration: "none" }}
-                        >
-                          <span className="badge badge-green">✅ Tem WhatsApp</span>
-                        </a>
-                      ) : (
-                        <span className="badge badge-gray">❌ Sem WhatsApp</span>
-                      )}
-                    </td>
-
-                    <td title={r.endereco}>
-                      {r.endereco
-                        ? r.endereco.length > 35
-                          ? r.endereco.slice(0, 33) + "…"
-                          : r.endereco
-                        : <span style={{ color: "#cbd5e1" }}>—</span>}
-                    </td>
-
-                    <td className="td-site">
-                      {r.site ? (
-                        <a
-                          href={r.site.startsWith("http") ? r.site : `https://${r.site}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          title={r.site}
-                        >
-                          {displayUrl(r.site)}
-                        </a>
-                      ) : (
-                        <span className="badge" style={{
-                          background: "#fef3c7",
-                          color: "#92400e",
-                          fontSize: "0.7rem",
-                        }}>
-                          Sem site
-                        </span>
-                      )}
-                    </td>
-
-                    <td className="td-rating">
-                      {r.avaliacao
-                        ? `${r.avaliacao} ⭐`
-                        : <span style={{ color: "#cbd5e1" }}>—</span>}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        {sessionId && (
+          <ResultsTable
+            resultados={resultados}
+            sessionId={sessionId}
+            concluido={concluido}
+            apenasSemSite={apenasSemSite}
+          />
         )}
-
-        {resultadosFiltrados.length > 10 && (
-          <div style={{ marginTop: "16px", textAlign: "right" }}>
-            <button className="btn-export" onClick={handleExport}>
-              ⬇️ Exportar {apenasSemSite ? "sem site " : ""}(.xlsx)
-            </button>
-          </div>
-        )}
-      </div>
+      </main>
     </div>
   );
 }
