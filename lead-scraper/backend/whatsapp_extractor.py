@@ -24,20 +24,20 @@ PATTERNS = [
         r"(?i)(?:whatsapp|whats\s*app|whasapp|wpp|zap)[^0-9+]{0,60}"
         r"(\+[\d\s\-().]{7,20})"
     ), "contexto_intl"),
-    # Formato brasileiro próximo a "whatsapp/zap"
+    # Formato brasileiro próximo a "whatsapp/zap"  — (DDD) + número
     (re.compile(
         r"(?i)(?:whatsapp|wpp|zap)[^0-9]{0,30}"
-        r"\(?(?\d{2})\)?[\s.-]?(\d{4,5})[\s.-]?(\d{4})"
+        r"\(?(\d{2})\)?[\s.-]?(\d{4,5})[\s.-]?(\d{4})"
     ), "contexto_br"),
-    # Número brasileiro no href (detecta +55 explícito)
-    (re.compile(r"href=[\"'][^\"']*\+55(\d{10,11})[\"']"), "br_href"),
+    # Número brasileiro no href com +55 explícito
+    (re.compile(r'href=["\'][^"\']*\+55(\d{10,11})["\']'), "br_href"),
 ]
 
 
 async def extract_whatsapp(url: str) -> str | None:
     """
     Faz GET na URL do site e procura por links/números de WhatsApp no HTML.
-    Também tenta a página /contato ou /contact se não achar no index.
+    Também tenta páginas de contato se não achar no index.
     Retorna o número limpo ou None.
     """
     if not url or not url.startswith("http"):
@@ -50,7 +50,7 @@ async def extract_whatsapp(url: str) -> str | None:
         if resultado:
             return resultado
 
-    # Tentar em páginas de contato se não achou
+    # Tentar em páginas de contato comuns
     base = url.rstrip("/")
     for path in ["/contato", "/contact", "/fale-conosco", "/whatsapp"]:
         html_extra = await _fetch_html(f"{base}{path}")
@@ -128,20 +128,17 @@ def _limpar_numero(numero: str) -> str | None:
 async def extract_whatsapp_batch(resultados: list[dict], session: dict) -> None:
     """
     Enriquece os resultados com WhatsApp em paralelo.
-    Melhorias v2:
-    - Pula resultados que já têm WhatsApp (extraído do Google Maps)
-    - Semáforo aumentado de 5 para 8 requisições simultâneas
-    - Timeout reduzido de 10s para 8s por site
+    - Pula resultados que já têm WhatsApp extraído do Google Maps
+    - 8 requisições simultâneas (era 5)
+    - Timeout reduzido para 8s por site (era 10s)
     """
     # Filtrar só os que precisam de busca no site
-    # (os que já têm whatsapp do GMaps são pulados)
     pendentes = [r for r in resultados if not r.get("whatsapp") and r.get("site")]
-    ja_tem = len(resultados) - len(pendentes) - len([r for r in resultados if not r.get("site")])
+    ja_tem = sum(1 for r in resultados if r.get("whatsapp"))
 
     total = len(pendentes)
     processados_wpp = 0
 
-    # Semáforo aumentado: 8 requisições simultâneas (era 5)
     semaphore = asyncio.Semaphore(8)
 
     async def process_one(resultado: dict):
@@ -152,10 +149,8 @@ async def extract_whatsapp_batch(resultados: list[dict], session: dict) -> None:
             resultado["whatsapp"] = wpp
 
             processados_wpp += 1
-            session["status"] = (
-                f"Extraindo WhatsApp dos sites... ({processados_wpp}/{total})"
-                + (f" | {ja_tem} já obtidos do Google Maps" if ja_tem > 0 else "")
-            )
+            sufixo = f" | {ja_tem} já obtidos do Google Maps" if ja_tem > 0 else ""
+            session["status"] = f"Extraindo WhatsApp dos sites... ({processados_wpp}/{total}){sufixo}"
             session["resultados"] = list(resultados)
 
     if pendentes:
