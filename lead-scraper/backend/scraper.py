@@ -71,12 +71,26 @@ def _termos_localizacao(localizacao: str) -> list[str]:
     return list(termos)
 
 
+def _termo_no_endereco(termo: str, endereco_norm: str) -> bool:
+    """
+    Verifica se um termo aparece no endereço de forma correta.
+    Termos curtos (siglas como "ca", "sp", "ny"): word boundary — não bate
+    em substrings de outras palavras (ex: "ca" NÃO bate em "angelica").
+    Termos longos (ex: "california", "salvador"): substring simples.
+    """
+    if len(termo) <= 3:
+        padrao = r"(?<![a-z])" + re.escape(termo) + r"(?![a-z])"
+        return bool(re.search(padrao, endereco_norm))
+    return termo in endereco_norm
+
+
 def _endereco_na_localizacao(endereco: str, localizacao: str) -> bool:
     """
-    Filtro geográfico simplificado:
+    Filtro geográfico:
     - Se tem endereço → verificar se contém termos da localização
     - Se não tem endereço → aceitar (sem dados suficientes para rejeitar)
-    Sem verificação de DDI — era complexo demais e gerava falsos negativos.
+    Usa word boundary para siglas curtas para evitar falsos positivos
+    em palavras como "angelica", "cabrini", "consolacao".
     """
     if not endereco or not endereco.strip() or not localizacao:
         return True
@@ -87,7 +101,7 @@ def _endereco_na_localizacao(endereco: str, localizacao: str) -> bool:
     if not termos:
         return True
 
-    return any(termo in endereco_norm for termo in termos)
+    return any(_termo_no_endereco(termo, endereco_norm) for termo in termos)
 
 
 def _chave_unica(dados: dict) -> str:
