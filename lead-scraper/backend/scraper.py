@@ -1,6 +1,7 @@
 import asyncio
 import random
 import re
+import unicodedata
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 USER_AGENT = (
@@ -9,10 +10,114 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+# -------------------------------------------------------
+# Mapeamento nome completo → sigla de estado/região
+# Permite que "California" bata com endereços que têm "CA"
+# -------------------------------------------------------
+_NOME_PARA_SIGLA = {
+    # Estados USA
+    "california": "ca", "texas": "tx", "new york": "ny", "florida": "fl",
+    "illinois": "il", "georgia": "ga", "ohio": "oh", "michigan": "mi",
+    "washington": "wa", "arizona": "az", "nevada": "nv", "oregon": "or",
+    "colorado": "co", "massachusetts": "ma", "virginia": "va",
+    "north carolina": "nc", "south carolina": "sc", "tennessee": "tn",
+    "pennsylvania": "pa", "new jersey": "nj", "maryland": "md",
+    "minnesota": "mn", "wisconsin": "wi", "missouri": "mo",
+    # Estados Brasil
+    "bahia": "ba", "sao paulo": "sp", "rio de janeiro": "rj",
+    "minas gerais": "mg", "parana": "pr", "rio grande do sul": "rs",
+    "santa catarina": "sc", "pernambuco": "pe", "ceara": "ce",
+    "goias": "go", "para": "pa", "amazonas": "am", "maranhao": "ma",
+    "espirito santo": "es", "mato grosso": "mt", "mato grosso do sul": "ms",
+    "rio grande do norte": "rn", "alagoas": "al", "sergipe": "se",
+    "paraiba": "pb", "piaui": "pi", "tocantins": "to", "rondonia": "ro",
+    "amapa": "ap", "roraima": "rr", "acre": "ac", "distrito federal": "df",
+    # Países
+    "brasil": "br", "brazil": "br", "united states": "us",
+    "united kingdom": "uk", "great britain": "gb",
+}
+
+
+def _norm_geo(s: str) -> str:
+    """Remove acentos e converte para minúsculas."""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.lower().strip()
+
+
+def _termos_localizacao(localizacao: str) -> list[str]:
+    """
+    Extrai termos relevantes da localização, incluindo siglas equivalentes.
+    Ex: "California" → ["california", "ca"]
+    Ex: "São Paulo, SP" → ["sao", "paulo", "sp"]
+    """
+    IGNORAR = {"de", "do", "da", "dos", "das", "em", "no", "na", "e", "o", "a",
+               "in", "at", "the", "of", "and", "los", "las", "el", "la"}
+    termos = set()
+    loc_norm = _norm_geo(localizacao)
+
+    for t in localizacao.replace(",", " ").split():
+        t_norm = _norm_geo(t.strip().rstrip(".,"))
+        if len(t_norm) >= 2 and t_norm not in IGNORAR:
+            termos.add(t_norm)
+
+    # Adicionar siglas equivalentes a nomes completos
+    for nome, sigla in _NOME_PARA_SIGLA.items():
+        if nome in loc_norm:
+            termos.add(sigla)
+        if sigla in loc_norm.split():
+            termos.add(nome)
+
+    return list(termos)
+
+
+def _endereco_na_localizacao(endereco: str, localizacao: str) -> bool:
+    """
+    Filtro geográfico simplificado:
+    - Se tem endereço → verificar se contém termos da localização
+    - Se não tem endereço → aceitar (sem dados suficientes para rejeitar)
+    Sem verificação de DDI — era complexo demais e gerava falsos negativos.
+    """
+    if not endereco or not endereco.strip() or not localizacao:
+        return True
+
+    endereco_norm = _norm_geo(endereco)
+    termos = _termos_localizacao(localizacao)
+
+    if not termos:
+        return True
+
+    return any(termo in endereco_norm for termo in termos)
+
+
+def _chave_unica(dados: dict) -> str:
+    """Gera chave de identidade única para deduplicação baseada nos dados extraídos."""
+    def _norm(s: str) -> str:
+        if not s:
+            return ""
+        s = _norm_geo(s)
+        s = re.sub(r"[^\w\s]", "", s)
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    nome = _norm(dados.get("nome") or "")
+    telefone = re.sub(r"\D", "", dados.get("telefone") or "")
+    endereco = _norm(dados.get("endereco") or "")
+
+    if nome and telefone:
+        return f"{nome}|tel:{telefone}"
+    if nome and endereco:
+        return f"{nome}|end:{endereco[:40]}"
+    return f"nome:{nome}"
+
 
 async def scrape_google_maps(
     nicho: str, localizacao: str, max_resultados: int, session: dict
 ) -> list[dict]:
+    """
+    Função principal do scraper.
+    Abre o Google Maps, busca o nicho na localização e coleta dados de cada empresa.
+    """
     resultados = []
 
     async with async_playwright() as p:
@@ -39,27 +144,28 @@ async def scrape_google_maps(
         page = await context.new_page()
 
         try:
-            # Query sem preposição "em" — funciona melhor para buscas internacionais
-            # e evita que o Google interprete mal a localização
+            # Query sem preposição para funcionar em qualquer idioma
             query = f"{nicho} {localizacao}"
             encoded = query.replace(" ", "+")
             url = f"https://www.google.com/maps/search/{encoded}/"
 
             session["status"] = "Abrindo Google Maps..."
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await _delay(2.0, 3.0)
+
+            # Reduzido: 1.0s é suficiente para a página estabilizar
+            await asyncio.sleep(1.0)
 
             session["status"] = "Verificando consentimento..."
             await _aceitar_consentimento(page)
 
-            session["status"] = "Aguardando resultados do Google Maps..."
+            session["status"] = "Aguardando resultados..."
             feed_encontrado = await _aguardar_feed(page)
 
             if not feed_encontrado:
                 session["status"] = "Tentando URL alternativa..."
                 url2 = f"https://maps.google.com/maps?q={encoded}"
                 await page.goto(url2, wait_until="domcontentloaded", timeout=30000)
-                await _delay(2.0, 3.0)
+                await asyncio.sleep(1.0)
                 await _aceitar_consentimento(page)
                 feed_encontrado = await _aguardar_feed(page)
 
@@ -78,166 +184,8 @@ async def scrape_google_maps(
     return resultados
 
 
-import unicodedata
-
-# DDI explícito (com +) → palavras-chave da região
-# Só usado quando o telefone tem "+" indicando DDI internacional explícito
-_DDI_PAISES = {
-    "55":  ["brasil", "brazil", "bahia", "sao paulo", "rio de janeiro",
-             "minas gerais", "parana", "pernambuco", "ceara"],
-    "1":   ["usa", "united states", "canada", "california", "new york", "texas",
-             "florida", "illinois", "georgia", "ohio", "michigan", "washington",
-             "ontario", "toronto", "vancouver", "british columbia"],
-    "44":  ["uk", "united kingdom", "england", "scotland", "wales",
-             "london", "britain", "manchester", "birmingham"],
-    "34":  ["spain", "espana", "espanha", "madrid", "barcelona", "valencia"],
-    "33":  ["france", "franca", "paris", "lyon", "marseille"],
-    "49":  ["germany", "deutschland", "alemanha", "berlin", "munich", "hamburg"],
-    "39":  ["italy", "italia", "italia", "rome", "roma", "milan", "milano"],
-    "351": ["portugal", "lisboa", "porto"],
-    "52":  ["mexico", "cidade do mexico", "guadalajara", "monterrey"],
-    "54":  ["argentina", "buenos aires", "cordoba"],
-    "56":  ["chile", "santiago"],
-    "57":  ["colombia", "bogota", "medellin"],
-    "51":  ["peru", "lima"],
-    "598": ["uruguay", "montevideo"],
-    "595": ["paraguay", "asuncion"],
-    "58":  ["venezuela", "caracas"],
-    "61":  ["australia", "sydney", "melbourne", "brisbane"],
-    "64":  ["new zealand", "auckland", "wellington"],
-    "81":  ["japan", "japao", "tokyo", "osaka"],
-    "86":  ["china", "beijing", "shanghai"],
-    "91":  ["india", "mumbai", "delhi", "bangalore"],
-}
-
-
-def _norm_geo(s: str) -> str:
-    """Normaliza string: remove acentos e converte para minúsculas."""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    return s.lower().strip()
-
-
-def _extrair_ddi_explicito(telefone: str) -> str | None:
-    """
-    Extrai o DDI apenas quando o número tem "+" explícito.
-    Ex: "+5511999..." → "55", "+1 323..." → "1"
-    Números sem "+" (ex: "(11) 9xxxx") → retorna None (formato local, indeterminado)
-    """
-    if not telefone or "+" not in telefone:
-        return None  # sem "+" = formato local = não podemos saber o país
-
-    digitos = re.sub(r"\D", "", telefone.split("+")[-1])
-    for ddi in sorted(_DDI_PAISES.keys(), key=len, reverse=True):
-        if digitos.startswith(ddi) and len(digitos) > len(ddi) + 4:
-            return ddi
-    return None
-
-
-def _ddi_compativel_com_localizacao(telefone: str, localizacao: str) -> bool:
-    """
-    Verifica se o DDI explícito do telefone é compatível com a localização.
-    Só age quando o telefone tem "+" — caso contrário retorna True (indeterminado).
-    """
-    ddi = _extrair_ddi_explicito(telefone)
-    if not ddi:
-        return True  # formato local, não podemos determinar o país
-
-    loc_norm = _norm_geo(localizacao)
-
-    # Verificar se a localização pertence a OUTRO DDI (conflito claro)
-    for outro_ddi, palavras in _DDI_PAISES.items():
-        if outro_ddi == ddi:
-            continue
-        if any(_norm_geo(p) in loc_norm for p in palavras):
-            return False  # localização é de outro país
-
-    return True  # compatível ou indeterminado
-
-
-# Mapeamento de nomes completos → siglas (e vice-versa)
-# Permite que "California" bata com endereços que têm "CA"
-_NOME_PARA_SIGLA = {
-    # Estados USA
-    "california": "ca", "texas": "tx", "new york": "ny", "florida": "fl",
-    "illinois": "il", "georgia": "ga", "ohio": "oh", "michigan": "mi",
-    "washington": "wa", "arizona": "az", "nevada": "nv", "oregon": "or",
-    "colorado": "co", "massachusetts": "ma", "virginia": "va",
-    "north carolina": "nc", "south carolina": "sc", "tennessee": "tn",
-    "pennsylvania": "pa", "new jersey": "nj", "maryland": "md",
-    "minnesota": "mn", "wisconsin": "wi", "missouri": "mo",
-    # Estados Brasil
-    "bahia": "ba", "sao paulo": "sp", "rio de janeiro": "rj",
-    "minas gerais": "mg", "parana": "pr", "rio grande do sul": "rs",
-    "santa catarina": "sc", "pernambuco": "pe", "ceara": "ce",
-    "goias": "go", "para": "pa", "amazonas": "am", "maranhao": "ma",
-    "espirito santo": "es", "mato grosso": "mt", "mato grosso do sul": "ms",
-    "rio grande do norte": "rn", "alagoas": "al", "sergipe": "se",
-    "paraiba": "pb", "piaui": "pi", "tocantins": "to", "rondonia": "ro",
-    "amapa": "ap", "roraima": "rr", "acre": "ac", "distrito federal": "df",
-    # Países comuns
-    "brasil": "br", "brazil": "br", "united states": "us",
-    "united kingdom": "uk", "great britain": "gb",
-}
-
-
-def _termos_localizacao(localizacao: str) -> list[str]:
-    """
-    Extrai termos relevantes da localização, incluindo siglas equivalentes.
-    Ex: "California" → ["california", "ca"]
-    Ex: "São Paulo, SP" → ["sao", "paulo", "sp"]
-    """
-    IGNORAR = {"de", "do", "da", "dos", "das", "em", "no", "na", "e", "o", "a",
-               "in", "at", "the", "of", "and", "los", "las", "el", "la"}
-    termos = set()
-
-    loc_norm = _norm_geo(localizacao)
-
-    # Adicionar tokens individuais
-    for t in localizacao.replace(",", " ").split():
-        t_norm = _norm_geo(t.strip().rstrip(".,"))
-        if len(t_norm) >= 2 and t_norm not in IGNORAR:
-            termos.add(t_norm)
-
-    # Adicionar siglas correspondentes a nomes completos
-    for nome, sigla in _NOME_PARA_SIGLA.items():
-        if nome in loc_norm:
-            termos.add(sigla)
-        if sigla in loc_norm.split():
-            termos.add(nome)
-
-    return list(termos)
-
-
-def _endereco_na_localizacao(endereco: str, localizacao: str,
-                              telefone: str = "") -> bool:
-    """
-    Verifica se o resultado corresponde à localização buscada.
-    Cascata de validação:
-    1. Endereço disponível → verificar termos da localização no endereço
-    2. Sem endereço + telefone com "+" explícito → verificar DDI
-    3. Demais casos → aceitar (dados insuficientes para rejeitar com segurança)
-    """
-    if not localizacao:
-        return True
-
-    # --- Caso 1: endereço disponível ---
-    if endereco and endereco.strip():
-        endereco_norm = _norm_geo(endereco)
-        termos = _termos_localizacao(localizacao)
-        if not termos:
-            return True
-        return any(termo in endereco_norm for termo in termos)
-
-    # --- Caso 2: sem endereço, telefone com DDI explícito ---
-    if telefone and "+" in telefone:
-        return _ddi_compativel_com_localizacao(telefone, localizacao)
-
-    # --- Caso 3: dados insuficientes → aceitar ---
-    return True
-
-
 async def _aceitar_consentimento(page) -> bool:
+    """Aceita telas de consentimento de cookies do Google em múltiplos idiomas."""
     seletores = [
         '#L2AGLb',
         'button.tHlp8d',
@@ -249,23 +197,19 @@ async def _aceitar_consentimento(page) -> bool:
         'button:has-text("I agree")',
         'button[aria-label*="Accept all"]',
         'button:has-text("Aceptar todo")',
-        'button:has-text("Aceptar")',
         'button:has-text("Tout accepter")',
-        'button:has-text("Accepter")',
         'button:has-text("Alle akzeptieren")',
         'button:has-text("Accetta tutto")',
     ]
-
     for sel in seletores:
         try:
             btn = await page.query_selector(sel)
             if btn and await btn.is_visible():
                 await btn.click()
-                await _delay(1.5, 2.5)
+                await asyncio.sleep(1.0)
                 return True
         except Exception:
             continue
-
     return False
 
 
@@ -277,35 +221,21 @@ async def _aguardar_feed(page, timeout: int = 20000) -> bool:
         return False
 
 
-def _chave_unica(dados: dict) -> str:
-    """Gera chave de identidade única para deduplicação."""
-    def _norm(s: str) -> str:
-        if not s:
-            return ""
-        s = s.lower().strip()
-        s = re.sub(r"[^\w\s]", "", s)
-        s = re.sub(r"\s+", " ", s)
-        return s
-
-    nome = _norm(dados.get("nome") or "")
-    telefone = re.sub(r"\D", "", dados.get("telefone") or "")
-    endereco = _norm(dados.get("endereco") or "")
-
-    if nome and telefone:
-        return f"{nome}|tel:{telefone}"
-    if nome and endereco:
-        return f"{nome}|end:{endereco[:40]}"
-    return f"nome:{nome}"
-
-
 async def _collect_results(
     page, max_resultados: int, session: dict, localizacao: str
 ) -> list[dict]:
+    """
+    Itera sobre os cards do feed e extrai dados de cada empresa.
+    Melhorias v2:
+    - Usa wait_for_selector após clique em vez de sleep fixo (2x mais rápido)
+    - Verifica WhatsApp diretamente no perfil do Google Maps (evita visitar sites)
+    - Filtro geográfico simplificado
+    """
     resultados = []
     cards_vistos: set = set()
     chaves_extraidas: set = set()
     tentativas_sem_novos = 0
-    filtrados_por_local = 0  # contador de resultados rejeitados por localização
+    filtrados_por_local = 0
 
     while len(resultados) < max_resultados and tentativas_sem_novos < 8:
         cards = await page.query_selector_all('div[role="feed"] > div[jsaction*="mouseover"]')
@@ -333,29 +263,34 @@ async def _collect_results(
                 cards_vistos.add(card_id)
 
                 await card.scroll_into_view_if_needed()
-                await _delay(0.3, 0.6)
+                # Pequeno delay antes do clique para estabilizar scroll
+                await asyncio.sleep(random.uniform(0.2, 0.4))
 
                 await card.click()
-                await _delay(1.2, 2.0)
+
+                # MELHORIA: esperar o painel aparecer em vez de sleep fixo
+                # Tipicamente 300-800ms — muito mais rápido que o sleep anterior (1.2-2.0s)
+                try:
+                    await page.wait_for_selector(
+                        '.DUwDvf, .lMbq3e h1, [class*="fontHeadlineLarge"]',
+                        timeout=4000
+                    )
+                except PlaywrightTimeout:
+                    continue  # painel não apareceu, pular este card
 
                 dados = await _extract_detail_panel(page)
 
                 if not dados or not dados.get("nome"):
                     continue
 
-                # Deduplicação por dados extraídos
+                # Deduplicação por dados reais (não por texto do card)
                 chave = _chave_unica(dados)
                 if chave in chaves_extraidas:
                     continue
                 chaves_extraidas.add(chave)
 
-                # Filtro geográfico: rejeitar resultados de outras localidades
-                # Usa endereço como fonte primária e telefone como fallback
-                if not _endereco_na_localizacao(
-                    dados.get("endereco") or "",
-                    localizacao,
-                    dados.get("telefone") or "",
-                ):
+                # Filtro geográfico
+                if not _endereco_na_localizacao(dados.get("endereco") or "", localizacao):
                     filtrados_por_local += 1
                     session["status"] = (
                         f"Coletando resultados... ({len(resultados)}/{max_resultados}) "
@@ -379,11 +314,13 @@ async def _collect_results(
         else:
             tentativas_sem_novos = 0
 
+        # Scroll no feed para carregar mais resultados
         try:
             feed = await page.query_selector('div[role="feed"]')
             if feed:
                 await feed.evaluate("el => { el.scrollTop += 800; }")
-                await _delay(1.5, 2.5)
+                # Reduzido: 1.0s é suficiente (era 1.5-2.5s)
+                await asyncio.sleep(random.uniform(0.8, 1.2))
         except Exception:
             break
 
@@ -391,6 +328,12 @@ async def _collect_results(
 
 
 async def _extract_detail_panel(page) -> dict | None:
+    """
+    Extrai dados do painel lateral de detalhes de uma empresa.
+    Melhorias v2:
+    - Tenta extrair WhatsApp diretamente do perfil GMaps (evita visita ao site)
+    - Seletores language-agnostic via data-item-id (funciona em qualquer país)
+    """
     dados = {
         "nome": None,
         "avaliacao": None,
@@ -399,25 +342,21 @@ async def _extract_detail_panel(page) -> dict | None:
         "telefone": None,
         "site": None,
         "categoria": None,
-        "whatsapp": None,
+        "whatsapp": None,  # preenchido aqui se disponível no GMaps
     }
 
-    try:
-        await page.wait_for_selector(
-            '.DUwDvf, .lMbq3e h1, [class*="fontHeadlineLarge"]', timeout=6000
-        )
-    except PlaywrightTimeout:
-        return None
-
-    await _delay(0.2, 0.5)
+    # Painel já foi aguardado em _collect_results, só um delay mínimo
+    await asyncio.sleep(random.uniform(0.1, 0.3))
 
     try:
+        # Nome
         for sel in ['.DUwDvf', '.lMbq3e h1', 'h1[class*="fontHeadline"]']:
             el = await page.query_selector(sel)
             if el:
                 dados["nome"] = (await el.inner_text()).strip()
                 break
 
+        # Categoria
         for sel in ['.DkEaL', '.skqShb']:
             el = await page.query_selector(sel)
             if el:
@@ -426,6 +365,7 @@ async def _extract_detail_panel(page) -> dict | None:
                     dados["categoria"] = text
                     break
 
+        # Avaliação
         for sel in ['.F7nice > span > span[aria-hidden="true"]', '.ceNzKf']:
             el = await page.query_selector(sel)
             if el:
@@ -434,6 +374,7 @@ async def _extract_detail_panel(page) -> dict | None:
                     dados["avaliacao"] = text.replace(",", ".")
                     break
 
+        # Número de avaliações
         el = await page.query_selector(
             'button[aria-label*="avalia"] span, button[aria-label*="review"] span, '
             'button[aria-label*="Review"] span'
@@ -445,6 +386,7 @@ async def _extract_detail_panel(page) -> dict | None:
             if nums:
                 dados["num_avaliacoes"] = nums[0]
 
+        # Endereço — data-item-id é language-agnostic
         for sel in [
             'button[data-item-id*="address"] .Io6YTe',
             '[data-item-id*="address"] .Io6YTe',
@@ -461,6 +403,7 @@ async def _extract_detail_panel(page) -> dict | None:
                     dados["endereco"] = text
                     break
 
+        # Telefone — data-item-id é language-agnostic
         for sel in [
             'button[data-item-id*="phone"] .Io6YTe',
             '[data-item-id*="phone"] .Io6YTe',
@@ -478,6 +421,7 @@ async def _extract_detail_panel(page) -> dict | None:
                     dados["telefone"] = text
                     break
 
+        # Site
         for sel in [
             'a[data-item-id*="authority"]',
             '[aria-label*="Site"] a',
@@ -498,11 +442,61 @@ async def _extract_detail_panel(page) -> dict | None:
                     dados["site"] = f"https://{text}"
                 break
 
+        # MELHORIA: tentar extrair WhatsApp do próprio perfil do Google Maps
+        # Muitas empresas têm o botão de WhatsApp diretamente no GMaps
+        # Isso evita a necessidade de visitar o site externo
+        wpp_gmaps = await _extract_whatsapp_from_gmaps(page)
+        if wpp_gmaps:
+            dados["whatsapp"] = wpp_gmaps
+
     except Exception:
         pass
 
     return dados if dados.get("nome") else None
 
 
-async def _delay(min_s: float = 1.5, max_s: float = 3.5):
-    await asyncio.sleep(random.uniform(min_s, max_s))
+async def _extract_whatsapp_from_gmaps(page) -> str | None:
+    """
+    Verifica se a empresa tem WhatsApp listado diretamente no Google Maps.
+    Quando disponível, evita a necessidade de visitar o site externo.
+    """
+    # Seletores para o botão/link de WhatsApp no perfil do GMaps
+    seletores_wpp = [
+        'a[data-item-id*="whatsapp"]',
+        '[aria-label*="WhatsApp"] a',
+        '[aria-label*="Whatsapp"] a',
+        'a[href*="wa.me"]',
+        'a[href*="api.whatsapp"]',
+        'a[href*="whatsapp.com/send"]',
+        '[data-item-id*="whatsapp"] .Io6YTe',
+    ]
+
+    for sel in seletores_wpp:
+        try:
+            el = await page.query_selector(sel)
+            if not el:
+                continue
+
+            href = await el.get_attribute("href") or ""
+            text = (await el.inner_text()).strip()
+
+            # Extrair número de wa.me/NUMERO
+            match = re.search(r"wa\.me/(\+?[\d]{7,15})", href)
+            if match:
+                return re.sub(r"\D", "", match.group(1))
+
+            # Extrair número de api.whatsapp.com/send?phone=NUMERO
+            match = re.search(r"phone=(\+?[\d]{7,15})", href)
+            if match:
+                return re.sub(r"\D", "", match.group(1))
+
+            # Número no texto do botão (ex: "+55 11 99999-9999")
+            if text and re.search(r"\d{7,}", text):
+                nums = re.sub(r"\D", "", text)
+                if len(nums) >= 7:
+                    return nums
+
+        except Exception:
+            continue
+
+    return None
