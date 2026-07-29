@@ -1,11 +1,8 @@
 export default function ResultsTable({ resultados, sessionId, concluido, apenasSemSite }) {
-  // Aplicar filtro se checkbox estiver marcado
   const resultadosFiltrados = apenasSemSite
     ? resultados.filter((r) => !r.site)
     : resultados;
 
-  // Contadores baseados nos dados filtrados
-  const qtdWpp = resultadosFiltrados.filter((r) => r.whatsapp).length;
   const qtdSemSite = resultados.filter((r) => !r.site).length;
 
   // Formatar domínio curto para exibição
@@ -19,13 +16,23 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
     }
   }
 
-  // Exportar apenas os resultados filtrados
+  // Gerar link wa.me a partir do número de telefone
+  // Remove tudo que não é dígito e monta a URL
+  function waLink(telefone) {
+    if (!telefone) return null;
+    const digits = telefone.replace(/\D/g, "");
+    if (digits.length < 7) return null;
+    return `https://wa.me/${digits}`;
+  }
+
   function handleExport() {
-    // Passar o filtro como query param para o backend saber quais exportar
-    // Como o filtro é no frontend, enviamos os IDs via workaround:
-    // O mais simples é exportar tudo e filtrar no download via blob
     if (apenasSemSite) {
-      exportarFiltrado(resultadosFiltrados);
+      const link = document.createElement("a");
+      link.href = `/api/export/${sessionId}?sem_site=true`;
+      link.download = `leads_sem_site_${sessionId.slice(0, 8)}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     } else {
       const link = document.createElement("a");
       link.href = `/api/export/${sessionId}`;
@@ -36,18 +43,6 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
     }
   }
 
-  // Para o filtro sem site, chamar o endpoint com query param
-  function exportarFiltrado(dados) {
-    // Usamos o endpoint padrão mas passando flag de filtro
-    const url = `/api/export/${sessionId}?sem_site=true`;
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `leads_sem_site_${sessionId.slice(0, 8)}.xlsx`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  }
-
   return (
     <div className="card">
       <div className="card-header">
@@ -56,7 +51,6 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
       </div>
 
       <div className="card-body">
-        {/* Cabeçalho com contadores */}
         <div className="results-header">
           <div className="results-counter">
             <span className="counter-badge">
@@ -65,11 +59,6 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
             {qtdSemSite > 0 && (
               <span className="counter-badge" style={{ background: "#fef3c7", color: "#92400e" }}>
                 🌐 <strong>{qtdSemSite}</strong> sem site
-              </span>
-            )}
-            {qtdWpp > 0 && (
-              <span className="counter-badge green">
-                💬 <strong>{qtdWpp}</strong> com WhatsApp
               </span>
             )}
             {apenasSemSite && (
@@ -86,7 +75,6 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
           )}
         </div>
 
-        {/* Aviso quando filtro está ativo */}
         {apenasSemSite && resultados.length > 0 && (
           <div style={{
             marginTop: "12px",
@@ -98,12 +86,10 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
             color: "#5b21b6",
           }}>
             🎯 Filtro ativo — mostrando <strong>{resultadosFiltrados.length}</strong> de{" "}
-            <strong>{resultados.length}</strong> contatos (sem site). Desmarque o filtro no
-            formulário para ver todos.
+            <strong>{resultados.length}</strong> contatos sem site.
           </div>
         )}
 
-        {/* Tabela ou empty state */}
         {resultadosFiltrados.length === 0 ? (
           <div className="empty-state">
             <span className="empty-icon">
@@ -111,7 +97,7 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
             </span>
             <span>
               {apenasSemSite && resultados.length > 0
-                ? "Nenhum contato sem site encontrado. Todos os resultados têm site."
+                ? "Nenhum contato sem site encontrado."
                 : "Os resultados aparecerão aqui conforme forem coletados..."}
             </span>
           </div>
@@ -123,7 +109,6 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
                   <th>#</th>
                   <th>Nome</th>
                   <th>Telefone</th>
-                  <th>WhatsApp</th>
                   <th>Endereço</th>
                   <th>Site</th>
                   <th>⭐</th>
@@ -138,26 +123,26 @@ export default function ResultsTable({ resultados, sessionId, concluido, apenasS
                       {r.nome || "—"}
                     </td>
 
+                    {/* Telefone clicável — abre WhatsApp com o número */}
                     <td className="td-phone">
-                      {r.telefone || <span style={{ color: "#cbd5e1" }}>—</span>}
-                    </td>
-
-                    <td>
-                      {r.whatsapp ? (
+                      {r.telefone ? (
                         <a
-                          href={
-                            r.whatsapp.startsWith("http")
-                              ? r.whatsapp
-                              : `https://wa.me/${r.whatsapp}`
-                          }
+                          href={waLink(r.telefone)}
                           target="_blank"
                           rel="noopener noreferrer"
-                          style={{ textDecoration: "none" }}
+                          style={{
+                            color: "#16a34a",
+                            textDecoration: "none",
+                            fontFamily: "monospace",
+                            fontSize: "0.8rem",
+                            fontWeight: 600,
+                          }}
+                          title="Abrir no WhatsApp"
                         >
-                          <span className="badge badge-green">✅ Tem WhatsApp</span>
+                          {r.telefone}
                         </a>
                       ) : (
-                        <span className="badge badge-gray">❌ Sem WhatsApp</span>
+                        <span style={{ color: "#cbd5e1" }}>—</span>
                       )}
                     </td>
 
