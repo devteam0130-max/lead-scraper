@@ -84,16 +84,43 @@ def _termo_no_endereco(termo: str, endereco_norm: str) -> bool:
     return termo in endereco_norm
 
 
+def _cep_brasileiro(endereco: str) -> bool:
+    """
+    Detecta CEP brasileiro: XXXXX-XXX (3 dígitos após o hífen).
+    ZIP americano zip+4 tem 4 dígitos — não é confundido.
+    """
+    return bool(re.search(r'\b\d{5}-\d{3}\b', endereco))
+
+
+def _buscando_brasil(localizacao: str) -> bool:
+    """Retorna True se a localização buscada é claramente no Brasil."""
+    loc_norm = _norm_geo(localizacao)
+    termos_br = ["brasil", "brazil", "sao paulo", "salvador", "rio de janeiro",
+                 "belo horizonte", "fortaleza", "recife", "curitiba", "manaus",
+                 "porto alegre", "brasilia", "goiania", "belem", "florianopolis"]
+    return any(t in loc_norm for t in termos_br)
+
+
 def _endereco_na_localizacao(endereco: str, localizacao: str) -> bool:
     """
-    Filtro geográfico:
-    - Se tem endereço → verificar se contém termos da localização
-    - Se não tem endereço → aceitar (sem dados suficientes para rejeitar)
-    Usa word boundary para siglas curtas para evitar falsos positivos
-    em palavras como "angelica", "cabrini", "consolacao".
+    Filtro geográfico em duas etapas:
+
+    1. Filtro negativo por CEP brasileiro (XXXXX-XXX):
+       Rejeita enderecos com CEP brasileiro quando a busca nao e no Brasil.
+       Resolve bairros SP com nomes como "Vila California", "Chacara California".
+
+    2. Filtro positivo por termos:
+       Verifica se o endereco contem termos da localizacao buscada.
+       Usa word boundary para siglas curtas (<=3 chars).
+
+    Sem endereco -> aceitar (dados insuficientes para rejeitar).
     """
     if not endereco or not endereco.strip() or not localizacao:
         return True
+
+    # Etapa 1: rejeitar CEP brasileiro em busca nao-brasileira
+    if _cep_brasileiro(endereco) and not _buscando_brasil(localizacao):
+        return False
 
     endereco_norm = _norm_geo(endereco)
     termos = _termos_localizacao(localizacao)
@@ -280,17 +307,35 @@ async def _collect_results(
                 # Pequeno delay antes do clique para estabilizar scroll
                 await asyncio.sleep(random.uniform(0.2, 0.4))
 
+                # Capturar nome atual do painel ANTES de clicar
+                # para detectar quando o painel muda (evita data mixing)
+                nome_atual = ""
+                try:
+                    el_atual = await page.query_selector('.DUwDvf, .lMbq3e h1')
+                    if el_atual:
+                        nome_atual = (await el_atual.inner_text()).strip()
+                except Exception:
+                    pass
+
                 await card.click()
 
-                # MELHORIA: esperar o painel aparecer em vez de sleep fixo
-                # Tipicamente 300-800ms — muito mais rápido que o sleep anterior (1.2-2.0s)
-                try:
-                    await page.wait_for_selector(
-                        '.DUwDvf, .lMbq3e h1, [class*="fontHeadlineLarge"]',
-                        timeout=4000
-                    )
-                except PlaywrightTimeout:
-                    continue  # painel não apareceu, pular este card
+                # Aguardar o painel carregar e MUDAR em relação ao card anterior
+                # Isso evita extrair dados do painel ainda carregando do card anterior
+                painel_ok = False
+                for _ in range(12):  # até ~2.4s de espera
+                    await asyncio.sleep(0.2)
+                    try:
+                        el = await page.query_selector('.DUwDvf, .lMbq3e h1')
+                        if el:
+                            nome_novo = (await el.inner_text()).strip()
+                            if nome_novo and nome_novo != nome_atual:
+                                painel_ok = True
+                                break
+                    except Exception:
+                        pass
+
+                if not painel_ok:
+                    continue  # painel não carregou ou não mudou
 
                 dados = await _extract_detail_panel(page)
 
