@@ -2,6 +2,7 @@ import asyncio
 import uuid
 import json
 import os
+import time
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, FileResponse
@@ -12,9 +13,8 @@ from scraper import scrape_google_maps
 from whatsapp_extractor import extract_whatsapp_batch
 from exporter import generate_xlsx
 
-app = FastAPI(title="Lead Scraper API", version="1.0.0")
+app = FastAPI(title="Lead Scraper API", version="2.0.0")
 
-# CORS liberado para qualquer origem (frontend pode estar em outro domínio)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,19 +24,47 @@ app.add_middleware(
 )
 
 # Armazenamento em memória por session_id
-# Formato: { session_id: { status, total, processados, resultados, concluido, erro } }
+# Inclui _criado_em para permitir limpeza automática
 sessions: dict = {}
+
+# Tempo máximo de vida de uma sessão (segundos)
+SESSION_TTL = 1800  # 30 minutos
 
 
 class SearchRequest(BaseModel):
     nicho: str
     localizacao: str
     max_resultados: int = 100
+    apenas_sem_site: bool = False  # filtro frontend, ignorado no backend
+
+
+async def _limpar_sessions_antigas():
+    """
+    Task em background que remove sessões expiradas a cada 5 minutos.
+    Evita vazamento de memória em uso contínuo.
+    """
+    while True:
+        await asyncio.sleep(300)  # verificar a cada 5 minutos
+        agora = time.time()
+        expiradas = [
+            sid for sid, s in list(sessions.items())
+            if agora - s.get("_criado_em", 0) > SESSION_TTL
+        ]
+        for sid in expiradas:
+            sessions.pop(sid, None)
+        if expiradas:
+            print(f"[Cleanup] {len(expiradas)} sessões expiradas removidas.")
+
+
+@app.on_event("startup")
+async def startup():
+    """Inicia a task de limpeza de sessões ao subir o servidor."""
+    asyncio.create_task(_limpar_sessions_antigas())
 
 
 @app.post("/api/search")
 async def search(req: SearchRequest, background_tasks: BackgroundTasks):
-    """Inicia uma busca no Google Maps e retorna o session_id para acompanhar o progresso."""
+    """Inicia uma busca no Google Maps e retorna o session_id."""
     session_id = str(uuid.uuid4())
 
     sessions[session_id] = {
@@ -46,6 +74,7 @@ async def search(req: SearchRequest, background_tasks: BackgroundTasks):
         "resultados": [],
         "concluido": False,
         "erro": None,
+        "_criado_em": time.time(),  # para limpeza automática
     }
 
     background_tasks.add_task(
@@ -60,7 +89,10 @@ async def search(req: SearchRequest, background_tasks: BackgroundTasks):
 
 
 async def run_scraping(session_id: str, nicho: str, localizacao: str, max_resultados: int):
-    """Tarefa em background que executa o scraping e enriquece os dados com WhatsApp."""
+    """Executa o scraping e enriquece resultados com WhatsApp."""
+    if session_id not in sessions:
+        return
+
     session = sessions[session_id]
 
     try:
@@ -69,8 +101,9 @@ async def run_scraping(session_id: str, nicho: str, localizacao: str, max_result
         resultados = await scrape_google_maps(nicho, localizacao, max_resultados, session)
         session["resultados"] = resultados
 
-        # Fase 2: extrair WhatsApp dos sites coletados
+        # Fase 2: extrair WhatsApp dos sites (pula quem já tem do GMaps)
         if resultados:
+            session["status"] = "Extraindo WhatsApp dos sites..."
             await extract_whatsapp_batch(resultados, session)
 
         session["status"] = "concluido"
@@ -88,7 +121,6 @@ async def run_scraping(session_id: str, nicho: str, localizacao: str, max_result
 async def get_status(session_id: str):
     """
     Server-Sent Events (SSE) — envia atualizações de progresso a cada 500ms.
-    Formato: { total, processados, status, resultados, concluido }
     """
     async def event_generator():
         if session_id not in sessions:
@@ -125,8 +157,11 @@ async def get_status(session_id: str):
 
 
 @app.get("/api/export/{session_id}")
-async def export(session_id: str):
-    """Gera e retorna o arquivo .xlsx com os resultados da sessão."""
+async def export(session_id: str, sem_site: bool = False):
+    """
+    Gera e retorna o arquivo .xlsx.
+    Se sem_site=true, exporta apenas resultados sem site.
+    """
     if session_id not in sessions:
         return Response(status_code=404, content="Sessão não encontrada")
 
@@ -135,8 +170,16 @@ async def export(session_id: str):
     if not resultados:
         return Response(status_code=404, content="Nenhum resultado para exportar")
 
+    # Aplicar filtro de sem site se solicitado
+    if sem_site:
+        resultados = [r for r in resultados if not r.get("site")]
+
+    if not resultados:
+        return Response(status_code=404, content="Nenhum resultado sem site para exportar")
+
     xlsx_bytes = generate_xlsx(resultados)
-    filename = f"leads_{session_id[:8]}.xlsx"
+    sufixo = "_sem_site" if sem_site else ""
+    filename = f"leads{sufixo}_{session_id[:8]}.xlsx"
 
     return Response(
         content=xlsx_bytes,
@@ -147,25 +190,25 @@ async def export(session_id: str):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "sessoes_ativas": len(sessions)}
+    return {
+        "status": "ok",
+        "sessoes_ativas": len(sessions),
+        "versao": "2.0.0",
+    }
 
 
 # -------------------------------------------------------
-# Servir o frontend React (build estático)
-# IMPORTANTE: este bloco deve ficar DEPOIS de todos os
-# endpoints /api para que o catch-all não os intercepte.
+# Frontend React — deve ficar DEPOIS dos endpoints /api
 # -------------------------------------------------------
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 
 if os.path.exists(FRONTEND_DIR):
-    # Arquivos estáticos gerados pelo Vite (JS, CSS, imagens)
     app.mount(
         "/assets",
         StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")),
         name="assets",
     )
 
-    # Catch-all: qualquer rota que não seja /api/* devolve o index.html (SPA)
     @app.get("/{full_path:path}")
     async def spa_fallback(full_path: str):
         return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
