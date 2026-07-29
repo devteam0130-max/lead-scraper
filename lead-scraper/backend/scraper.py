@@ -275,10 +275,14 @@ async def _collect_results(
     resultados = []
     cards_vistos: set = set()
     chaves_extraidas: set = set()
-    tentativas_sem_novos = 0
+    # Dois critérios de parada separados:
+    # - rodadas_sem_cards_novos: feed não está trazendo cards inéditos → chegou ao fim
+    # - rodadas_sem_aceitos: cards novos existem mas todos rejeitados/falham → parar
+    rodadas_sem_cards_novos = 0  # incrementa quando NENHUM card novo aparece no feed
+    rodadas_sem_aceitos = 0      # incrementa quando cards existem mas nenhum foi aceito
     filtrados_por_local = 0
 
-    while len(resultados) < max_resultados and tentativas_sem_novos < 8:
+    while len(resultados) < max_resultados and rodadas_sem_cards_novos < 5 and rodadas_sem_aceitos < 15:
         cards = await page.query_selector_all('div[role="feed"] > div[jsaction*="mouseover"]')
         if not cards:
             cards = await page.query_selector_all('div[role="feed"] > div[tabindex]')
@@ -368,10 +372,23 @@ async def _collect_results(
             except Exception:
                 continue
 
-        if novos_nesta_rodada == 0:
-            tentativas_sem_novos += 1
+        # Atualizar critérios de parada
+        cards_novos_nesta_rodada = sum(
+            1 for card_id in cards_vistos
+        ) - (len(cards_vistos) - novos_nesta_rodada)
+
+        # Verificar se apareceram cards inéditos no feed (independente de aceitar)
+        n_cards_antes = getattr(_collect_results, '_n_cards', 0)
+        if len(cards_vistos) > n_cards_antes:
+            rodadas_sem_cards_novos = 0
         else:
-            tentativas_sem_novos = 0
+            rodadas_sem_cards_novos += 1
+        _collect_results._n_cards = len(cards_vistos)  # type: ignore
+
+        if novos_nesta_rodada == 0:
+            rodadas_sem_aceitos += 1
+        else:
+            rodadas_sem_aceitos = 0
 
         # Scroll no feed para carregar mais resultados
         try:
